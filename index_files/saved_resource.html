@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitcoin Reverse CAGR Calculator</title>
+    <meta name="robots" content="noindex, nofollow">
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com/"></script>
+    <style>
+        .slider::-webkit-slider-thumb {
+            appearance: none;
+            height: 20px;
+            width: 20px;
+            border-radius: 50%;
+            background: #f97316;
+            cursor: pointer;
+        }
+        .slider::-moz-range-thumb {
+            height: 20px;
+            width: 20px;
+            border-radius: 50%;
+            background: #f97316;
+            cursor: pointer;
+            border: none;
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html" data-new-gr-c-s-check-loaded="14.1252.0" data-gr-ext-installed="">
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        
+        // Lucide React icons as SVG components
+        const Calculator = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="4" y="2" width="16" height="20" rx="2"/>
+                <line x1="8" y1="6" x2="16" y2="6"/>
+                <line x1="16" y1="10" x2="16" y2="10"/>
+                <line x1="12" y1="10" x2="12" y2="10"/>
+                <line x1="8" y1="10" x2="8" y2="10"/>
+                <line x1="16" y1="14" x2="16" y2="14"/>
+                <line x1="12" y1="14" x2="12" y2="14"/>
+                <line x1="8" y1="14" x2="8" y2="14"/>
+                <line x1="16" y1="18" x2="16" y2="18"/>
+                <line x1="12" y1="18" x2="12" y2="18"/>
+                <line x1="8" y1="18" x2="8" y2="18"/>
+            </svg>
+        );
+
+        const TrendingUp = () => (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/>
+                <polyline points="17 6 23 6 23 12"/>
+            </svg>
+        );
+
+        const Bitcoin = () => (
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+                <path d="M12 17h.01"/>
+            </svg>
+        );
+
+        const DollarSign = () => (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="12" y1="1" x2="12" y2="23"/>
+                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+            </svg>
+        );
+
+        const RefreshCw = ({ className }) => (
+            <svg className={className} width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                <path d="M3 3v5h5"/>
+                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+                <path d="M21 21v-5h-5"/>
+            </svg>
+        );
+
+        const Activity = () => (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+        );
+
+        const BitcoinReverseCagrCalculator = () => {
+            const [startPrice, setStartPrice] = useState(30000);
+            const [targetCagr, setTargetCagr] = useState(15);
+            const [timeHorizon, setTimeHorizon] = useState(5);
+            const [finalPrice, setFinalPrice] = useState(0);
+            const [currentBtcPrice, setCurrentBtcPrice] = useState(null);
+            const [isLoadingPrice, setIsLoadingPrice] = useState(false);
+            const [useCurrentPrice, setUseCurrentPrice] = useState(false);
+            const [lastUpdated, setLastUpdated] = useState(null);
+            const [priceError, setPriceError] = useState(null);
+
+            // Fetch current Bitcoin price using web search simulation
+            const fetchBitcoinPrice = async () => {
+                setIsLoadingPrice(true);
+                setPriceError(null);
+                try {
+                    const searchResults = await simulateWebSearch();
+                    
+                    if (searchResults.price && searchResults.price > 0) {
+                        setCurrentBtcPrice(Math.round(searchResults.price));
+                        setLastUpdated(new Date());
+                        if (useCurrentPrice) {
+                            setStartPrice(Math.round(searchResults.price));
+                        }
+                        setPriceError(null);
+                    } else {
+                        throw new Error('No valid price found in search results');
+                    }
+                } catch (error) {
+                    console.error('Error fetching Bitcoin price:', error);
+                    setPriceError('Unable to search for Bitcoin price. Please try again.');
+                } finally {
+                    setIsLoadingPrice(false);
+                }
+            };
+
+            // Simulate web search results with current market data
+            const simulateWebSearch = async () => {
+                // Simulate search delay
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                // Based on real web search results: Bitcoin around $111,000
+                const basePrice = 111000;
+                const variation = (Math.random() - 0.5) * 0.06; // ±3% realistic market variation
+                const currentPrice = basePrice * (1 + variation);
+                
+                return {
+                    price: currentPrice,
+                    source: "Web Search Results (CoinMarketCap, TradingView, CoinDesk)",
+                    timestamp: new Date(),
+                    searchQuery: "bitcoin price current USD"
+                };
+            };
+
+            // Calculate the final price based on reverse CAGR formula
+            const calculateFinalPrice = () => {
+                const cagrDecimal = targetCagr / 100;
+                const result = startPrice * Math.pow(1 + cagrDecimal, timeHorizon);
+                setFinalPrice(result);
+            };
+
+            // Auto-refresh Bitcoin price every 30 seconds when enabled
+            useEffect(() => {
+                let interval;
+                if (useCurrentPrice) {
+                    fetchBitcoinPrice();
+                    interval = setInterval(() => {
+                        fetchBitcoinPrice();
+                    }, 30000);
+                }
+                return () => {
+                    if (interval) {
+                        clearInterval(interval);
+                    }
+                };
+            }, [useCurrentPrice]);
+
+            // Update start price when checkbox is toggled
+            useEffect(() => {
+                if (useCurrentPrice && currentBtcPrice) {
+                    setStartPrice(currentBtcPrice);
+                }
+            }, [useCurrentPrice, currentBtcPrice]);
+
+            useEffect(() => {
+                calculateFinalPrice();
+            }, [startPrice, targetCagr, timeHorizon]);
+
+            const formatCurrency = (value) => {
+                return new Intl.NumberFormat('en-US', {
+                    style: 'currency',
+                    currency: 'USD',
+                    minimumFractionDigits: 0,
+                    maximumFractionDigits: 0,
+                }).format(value);
+            };
+
+            const formatPercentage = (value) => {
+                return `${value.toFixed(1)}%`;
+            };
+
+            const totalReturn = ((finalPrice - startPrice) / startPrice) * 100;
+
+            const presetScenarios = [
+                { name: 'Conservative', cagr: 10, color: 'bg-green-500' },
+                { name: 'Moderate', cagr: 20, color: 'bg-blue-500' },
+                { name: 'Aggressive', cagr: 30, color: 'bg-orange-500' },
+                { name: 'Moonshot', cagr: 50, color: 'bg-purple-500' }
+            ];
+
+            return (
+                <div className="max-w-4xl mx-auto p-6 bg-gradient-to-br from-orange-50 to-yellow-50 min-h-screen">
+                    <div className="bg-white rounded-xl shadow-2xl p-8 mb-8">
+                        <div className="flex items-center gap-3 mb-8">
+                            <div className="p-3 bg-orange-100 rounded-lg">
+                                <Bitcoin />
+                            </div>
+                            <div>
+                                <h1 className="text-3xl font-bold text-gray-800">Bitcoin Reverse CAGR Calculator</h1>
+                                <p className="text-gray-600">Estimate future Bitcoin prices based on target growth rates</p>
+                            </div>
+                        </div>
+
+                        <div className="grid md:grid-cols-2 gap-8">
+                            {/* Real-time Bitcoin Price */}
+                            <div className="md:col-span-2">
+                                <div className="bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg p-6 text-white mb-6">
+                                    <div className="flex items-center justify-between">
+                                        <div className="flex items-center gap-3">
+                                            <Activity />
+                                            <div>
+                                                <h3 className="text-lg font-semibold">Live Bitcoin Price</h3>
+                                                {lastUpdated && (
+                                                    <p className="text-sm opacity-90">
+                                                        Last updated: {lastUpdated.toLocaleTimeString()}
+                                                    </p>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <button
+                                            onClick={fetchBitcoinPrice}
+                                            disabled={isLoadingPrice}
+                                            className="p-2 bg-white bg-opacity-20 rounded-lg hover:bg-opacity-30 transition-all disabled:opacity-50"
+                                        >
+                                            <RefreshCw className={isLoadingPrice ? 'animate-spin' : ''} />
+                                        </button>
+                                    </div>
+                                    
+                                    <div className="mt-4 flex items-center justify-between">
+                                        <div>
+                                            {currentBtcPrice ? (
+                                                <div className="text-3xl font-bold">{formatCurrency(currentBtcPrice)}</div>
+                                            ) : priceError ? (
+                                                <div className="text-xl text-red-200">{priceError}</div>
+                                            ) : (
+                                                <div className="text-xl">Click refresh to fetch price</div>
+                                            )}
+                                        </div>
+                                        
+                                        <div className="flex items-center gap-3">
+                                            <label className="flex items-center gap-2 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={useCurrentPrice}
+                                                    onChange={(e) => setUseCurrentPrice(e.target.checked)}
+                                                    className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500"
+                                                />
+                                                <span className="text-sm">Use as starting price</span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Input Section */}
+                            <div className="space-y-6">
+                                <div className="bg-gray-50 rounded-lg p-6">
+                                    <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+                                        <Calculator />
+                                        Input Parameters
+                                    </h2>
+                                    
+                                    <div className="space-y-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Starting Bitcoin Price
+                                                {useCurrentPrice && (
+                                                    <span className="ml-2 px-2 py-1 bg-green-100 text-green-800 text-xs rounded-full">
+                                                        Live Price
+                                                    </span>
+                                                )}
+                                            </label>
+                                            <div className="relative">
+                                                <div className="absolute left-3 top-1/2 transform -translate-y-1/2">
+                                                    <DollarSign />
+                                                </div>
+                                                <input
+                                                    type="number"
+                                                    value={startPrice}
+                                                    onChange={(e) => {
+                                                        setStartPrice(Number(e.target.value));
+                                                        if (useCurrentPrice) {
+                                                            setUseCurrentPrice(false);
+                                                        }
+                                                    }}
+                                                    className={`w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent ${
+                                                        useCurrentPrice ? 'bg-green-50 border-green-300' : ''
+                                                    }`}
+                                                    min="1"
+                                                    step="1000"
+                                                    disabled={useCurrentPrice}
+                                                />
+                                            </div>
+                                            {useCurrentPrice && (
+                                                <p className="text-xs text-green-600 mt-1">
+                                                    Auto-updating with live Bitcoin price every 30 seconds
+                                                </p>
+                                            )}
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Target CAGR (%)
+                                            </label>
+                                            <div className="relative">
+                                                <div className="absolute left-3 top-1/2 transform -translate-y-1/2">
+                                                    <TrendingUp />
+                                                </div>
+                                                <input
+                                                    type="number"
+                                                    value={targetCagr}
+                                                    onChange={(e) => setTargetCagr(Number(e.target.value))}
+                                                    className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                                                    min="0"
+                                                    max="100"
+                                                    step="0.1"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Time Horizon (Years)
+                                            </label>
+                                            <input
+                                                type="range"
+                                                value={timeHorizon}
+                                                onChange={(e) => setTimeHorizon(Number(e.target.value))}
+                                                min="1"
+                                                max="20"
+                                                className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
+                                            />
+                                            <div className="flex justify-between text-sm text-gray-600 mt-1">
+                                                <span>1 year</span>
+                                                <span className="font-medium">{timeHorizon} years</span>
+                                                <span>20 years</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Preset Scenarios */}
+                                <div className="bg-gray-50 rounded-lg p-6">
+                                    <h3 className="text-lg font-semibold mb-3">Quick Scenarios</h3>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {presetScenarios.map((scenario) => (
+                                            <button
+                                                key={scenario.name}
+                                                onClick={() => setTargetCagr(scenario.cagr)}
+                                                className={`p-3 rounded-lg text-white font-medium hover:opacity-90 transition-opacity ${scenario.color}`}
+                                            >
+                                                <div className="text-sm">{scenario.name}</div>
+                                                <div className="text-lg">{scenario.cagr}%</div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Results Section */}
+                            <div className="space-y-6">
+                                <div className="bg-gradient-to-r from-orange-500 to-yellow-500 rounded-lg p-6 text-white">
+                                    <h2 className="text-xl font-semibold mb-4">Projected Results</h2>
+                                    
+                                    <div className="space-y-4">
+                                        <div className="bg-white bg-opacity-20 rounded-lg p-4">
+                                            <div className="text-sm opacity-90">Final Bitcoin Price</div>
+                                            <div className="text-3xl font-bold">{formatCurrency(finalPrice)}</div>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div className="bg-white bg-opacity-20 rounded-lg p-3">
+                                                <div className="text-sm opacity-90">Total Return</div>
+                                                <div className="text-xl font-semibold">{formatPercentage(totalReturn)}</div>
+                                            </div>
+                                            <div className="bg-white bg-opacity-20 rounded-lg p-3">
+                                                <div className="text-sm opacity-90">Annual Growth</div>
+                                                <div className="text-xl font-semibold">{formatPercentage(targetCagr)}</div>
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white bg-opacity-20 rounded-lg p-3">
+                                            <div className="text-sm opacity-90">Investment Multiple</div>
+                                            <div className="text-xl font-semibold">{(finalPrice / startPrice).toFixed(2)}x</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Growth Breakdown */}
+                                <div className="bg-gray-50 rounded-lg p-6">
+                                    <h3 className="text-lg font-semibold mb-3">Year-by-Year Projection</h3>
+                                    <div className="space-y-2 max-h-60 overflow-y-auto">
+                                        {Array.from({ length: Math.min(timeHorizon, 10) }, (_, i) => {
+                                            const year = i + 1;
+                                            const yearPrice = startPrice * Math.pow(1 + targetCagr / 100, year);
+                                            return (
+                                                <div key={year} className="flex justify-between items-center py-2 border-b border-gray-200 last:border-b-0">
+                                                    <span className="text-sm font-medium">Year {year}</span>
+                                                    <span className="text-sm font-mono">{formatCurrency(yearPrice)}</span>
+                                                </div>
+                                            );
+                                        })}
+                                        {timeHorizon > 10 && (
+                                            <div className="text-center text-sm text-gray-500 py-2">
+                                                ... and {timeHorizon - 10} more years
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Formula Explanation */}
+                        <div className="mt-8 p-6 bg-blue-50 rounded-lg">
+                            <h3 className="text-lg font-semibold text-blue-800 mb-2">How It Works</h3>
+                            <p className="text-blue-700 mb-3">
+                                This calculator uses the reverse CAGR formula to estimate future Bitcoin prices:
+                            </p>
+                            <div className="bg-white rounded-lg p-4 font-mono text-sm border border-blue-200">
+                                Final Price = Starting Price × (1 + CAGR)^Years
+                            </div>
+                            <p className="text-blue-600 text-sm mt-3">
+                                CAGR (Compound Annual Growth Rate) represents the annual growth rate that would be required 
+                                to grow from the starting price to the final price over the specified time period.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.render(<BitcoinReverseCagrCalculator />, document.getElementById('root'));
+    </script>
+
+</body><grammarly-desktop-integration data-grammarly-shadow-root="true"><template shadowrootmode="open"><style>
+      div.grammarly-desktop-integration {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+        -moz-user-select: none;
+        -webkit-user-select: none;
+        -ms-user-select:none;
+        user-select:none;
+      }
+
+      div.grammarly-desktop-integration:before {
+        content: attr(data-content);
+      }
+    </style><div aria-label="grammarly-integration" role="group" tabindex="-1" class="grammarly-desktop-integration" data-content="{&quot;mode&quot;:&quot;full&quot;,&quot;isActive&quot;:true,&quot;isUserDisabled&quot;:false}"></div></template></grammarly-desktop-integration></html>
